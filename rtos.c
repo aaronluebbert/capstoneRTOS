@@ -1,175 +1,159 @@
-#include "stm32f1xx_hal.h"
-#include <stdint.h>
-#include <stdbool.h>
-#include <string.h>
+// rtos_therm_fan_arduino.ino — cooperative rtos-ish loop for stm32f103c8t6 using arduino ide
+#include <Arduino.h>
+#include <math.h>
 
-// kernel config
-#define RTOS_TICK_HZ     1000u   // 1 kHz tick
-#define MAX_TASKS        8
-#define MAX_PRIORITIES   4
+// pins
+//  adjust if your wiring differs
+#define THERM_PIN       A0        // pa0 on blue pill
+#define FAN_PIN         PB0       // transistor/relay input
+#define LED_PIN         PC13      // built-in led on blue pill (active-low)
 
-typedef uint32_t tick_t;
+// scheduler config
+//  three periodic tasks, priority = index order
+struct Task {
+  int   (*run)(int state);     //  take an int state, return next state
+  uint32_t period_us;          //  period in microseconds
+  uint32_t next_due;           //  micros timestamp for next release
+  bool enabled;
+  const char* name;
+  int state;
+};
 
-// ipc: semaphore and queue
-typedef struct { volatile int count; } sem_t;
+#define ARRAY_LEN(x) (sizeof(x)/sizeof(x[0]))
 
-typedef struct {
-  uint16_t head, tail, size, capacity;
-  void *buf;
-  uint16_t elem_sz;
-} rtos_queue_t;
+// thermistor model (beta equation)
+//  10k ntc, beta 3950, series 10k, 3.3 v adc, 12-bit adc on f103 (0..4095)
+static const float TH_NOMINAL_OHMS = 10000.0f;
+static const float TH_BETA         = 3950.0f;
+static const float TH_SERIES_OHMS  = 10000.0f;
+static const float TH_REF_TEMP_K   = 298.15f;     // 25 c in kelvin
+static const float VREF_VOLT       = 3.3f;
+static const float ADC_MAX_COUNTS  = 4095.0f;
 
-// task control block
-//  take an int state, return next state
-typedef int (*task_fn)(int state);
+// hysteresis thresholds
+static const float TEMP_ON_C  = 35.0f;   // fan turns on at or above this
+static const float TEMP_OFF_C = 32.0f;   // fan turns off at or below this
 
-typedef struct {
-  task_fn run;
-  int     state;
-  tick_t  period;       // in ticks
-  tick_t  next_release; // absolute tick when to run next
-  uint8_t priority;     // 0 = highest
-  bool    enabled;
-  const char *name;
-} tcb_t;
+// moving average window
+#define AVG_WINDOW 32
 
-// globals
-static volatile tick_t g_ticks;
-static tcb_t tasks[MAX_TASKS];
-static uint8_t task_count;
+// shared state
+volatile bool  g_fan_on = false;
+volatile float g_temp_c = 25.0f;
 
-// timebase
-void SysTick_Handler(void) {
-  HAL_IncTick();
-  g_ticks++;
-}
-
-// ipc impl
-static inline void sem_init(sem_t *s, int initial) { s->count = initial; }
-static inline void sem_give(sem_t *s) { __disable_irq(); s->count++; __enable_irq(); }
-static inline bool sem_take(sem_t *s) {
-  bool ok = false;
-  __disable_irq();
-  if (s->count > 0) { s->count--; ok = true; }
-  __enable_irq();
-  return ok;
-}
-
-bool q_init(rtos_queue_t *q, void *buf, uint16_t elem_sz, uint16_t cap) {
-  q->buf = buf; q->elem_sz = elem_sz; q->capacity = cap;
-  q->size = 0; q->head = 0; q->tail = 0;
-  return true;
-}
-
-bool q_push(rtos_queue_t *q, const void *elem) {
-  bool ok = false;
-  __disable_irq();
-  if (q->size < q->capacity) {
-    memcpy((uint8_t*)q->buf + (q->tail * q->elem_sz), elem, q->elem_sz);
-    q->tail = (q->tail + 1) % q->capacity;
-    q->size++;
-    ok = true;
-  }
-  __enable_irq();
-  return ok;
-}
-
-bool q_pop(rtos_queue_t *q, void *out) {
-  bool ok = false;
-  __disable_irq();
-  if (q->size > 0) {
-    memcpy(out, (uint8_t*)q->buf + (q->head * q->elem_sz), q->elem_sz);
-    q->head = (q->head + 1) % q->capacity;
-    q->size--;
-    ok = true;
-  }
-  __enable_irq();
-  return ok;
-}
-
-// kernel api
-int rtos_add_task(const char *name, task_fn fn, int init_state, tick_t period, uint8_t priority) {
-  if (task_count >= MAX_TASKS) return -1;
-  tasks[task_count] = (tcb_t){
-    .run = fn,
-    .state = init_state,
-    .period = period,
-    .next_release = 0 + period,
-    .priority = priority,
-    .enabled = true,
-    .name = name
-  };
-  return task_count++;
-}
-
-static inline tick_t now(void) { return g_ticks; }
-
-// priority-ordered dispatcher
-static void rtos_dispatch(void) {
-  for (uint8_t pr = 0; pr < MAX_PRIORITIES; ++pr) {
-    for (uint8_t i = 0; i < task_count; ++i) {
-      tcb_t *t = &tasks[i];
-      if (!t->enabled || t->priority != pr) continue;
-      if ((int32_t)(now() - t->next_release) >= 0) {
-        t->state = t->run(t->state);
-        t->next_release += t->period;
-      }
-    }
-  }
-}
-
-// app data stubs
-typedef struct { float v, i, p; uint32_t ts; } sample_t;
-static rtos_queue_t sample_q; static sample_t sample_buf[64];
+// moving average buffer
+static float avg_buf[AVG_WINDOW];
+static uint32_t avg_idx = 0;
+static uint32_t avg_count = 0;
 
 // forward decls
 int task_sensor(int s);     //  1 kHz
-int task_comm(int s);       // 20 Hz
-int task_control(int s);    // 100 Hz
-int task_heartbeat(int s);  // 1 Hz
+int task_control(int s);    // 50 ms
+int task_fan_led(int s);    // 10 ms
 
-int main(void) {
-  HAL_Init();
-  SystemClock_Config();                              // set 72 mhz
-  SysTick_Config(SystemCoreClock / RTOS_TICK_HZ);    // 1 kHz rtos tick
+// task table
+static Task tasks[] = {
+  { task_sensor,   1000,    0, true, "Sensor",   0 },   // 1 kHz
+  { task_control,  50000,   0, true, "Control",  0 },   // 50 ms
+  { task_fan_led,  10000,   0, true, "FanLED",   0 },   // 10 ms
+};
 
-  // TODO: MX_GPIO_Init(); MX_I2C2_Init(); MX_USART3_UART_Init(); MX_TIM3_Init();
+// helper to schedule next release
+static inline void schedule_task(Task& t, uint32_t now_us) {
+  t.next_due = now_us + t.period_us;
+}
 
-  q_init(&sample_q, sample_buf, sizeof(sample_t), 64);
+// adc read and conversion
+//  divider: vout = vref * (r_th / (r_th + r_series))
+//  solve r_th, then beta equation to temperature
+static float counts_to_celsius(uint16_t counts) {
+  if (counts == 0) counts = 1;
+  if (counts >= (uint16_t)ADC_MAX_COUNTS) counts = (uint16_t)(ADC_MAX_COUNTS - 1);
 
-  rtos_add_task("Sensor",    task_sensor,    0, 1,    0);
-  rtos_add_task("Control",   task_control,   0, 10,   1);
-  rtos_add_task("Comms",     task_comm,      0, 50,   2);
-  rtos_add_task("Heartbeat", task_heartbeat, 0, 1000, 3);
+  float vout = (VREF_VOLT * (float)counts) / ADC_MAX_COUNTS;
+  float r_th = (TH_SERIES_OHMS * vout) / (VREF_VOLT - vout);
 
-  for (;;) {
-    rtos_dispatch();
+  float inv_t = (1.0f / TH_REF_TEMP_K) + (1.0f / TH_BETA) * logf(r_th / TH_NOMINAL_OHMS);
+  float temp_k = 1.0f / inv_t;
+  return temp_k - 273.15f;
+}
+
+// setup hardware
+void setup() {
+  // note: on stm32duino core, pin names like PB0 and PC13 are valid
+  pinMode(FAN_PIN, OUTPUT);
+  digitalWrite(FAN_PIN, LOW);        // fan off
+
+  pinMode(LED_PIN, OUTPUT);
+  digitalWrite(LED_PIN, HIGH);       // pc13 is active-low, high = led off
+
+  pinMode(THERM_PIN, INPUT_ANALOG);  // ensure analog mode on A0
+
+  // precompute initial schedule
+  uint32_t now = micros();
+  for (size_t i = 0; i < ARRAY_LEN(tasks); ++i) {
+    schedule_task(tasks[i], now);
   }
 }
 
-//  task implementations
-//  take an int state, return next state
+// cooperative dispatcher using micros
+void loop() {
+  uint32_t now = micros();
 
+  // simple priority scan in table order
+  for (size_t i = 0; i < ARRAY_LEN(tasks); ++i) {
+    Task& t = tasks[i];
+    if (!t.enabled) continue;
+
+    // handle micros wrap by signed delta
+    int32_t delta = (int32_t)(now - t.next_due);
+    if (delta >= 0) {
+      t.state = t.run(t.state);
+      schedule_task(t, now);
+    }
+  }
+
+  // optional tiny sleep to reduce spin if nothing due right now
+  // delayMicroseconds(50);
+}
+
+//  sensor task: read adc, convert to celsius, update moving average
 int task_sensor(int s) {
-  // read ina219 via i2c and compute moving averages
-  // enqueue latest sample
+  // multiple samples help tame switching noise
+  uint32_t acc = 0;
+  const int nsamp = 4;
+  for (int i = 0; i < nsamp; ++i) acc += (uint32_t)analogRead(THERM_PIN);
+  uint16_t raw = (uint16_t)(acc / nsamp);
+
+  float temp_c = counts_to_celsius(raw);
+
+  avg_buf[avg_idx] = temp_c;
+  avg_idx = (avg_idx + 1) % AVG_WINDOW;
+  if (avg_count < AVG_WINDOW) avg_count++;
+
+  float sum = 0.0f;
+  for (uint32_t i = 0; i < avg_count; ++i) sum += avg_buf[i];
+  g_temp_c = sum / (float)avg_count;
+
   return s;
 }
 
+//  control task: apply hysteresis and drive fan pin
 int task_control(int s) {
-  // consume latest sample
-  // apply thresholds and drive mosfet/relay
-  // read exti flags for switch and debounce
+  bool want_on = g_fan_on;
+
+  if (!g_fan_on && g_temp_c >= TEMP_ON_C) want_on = true;
+  if (g_fan_on && g_temp_c <= TEMP_OFF_C) want_on = false;
+
+  if (want_on != g_fan_on) {
+    g_fan_on = want_on;
+    digitalWrite(FAN_PIN, g_fan_on ? HIGH : LOW);
+  }
   return s;
 }
 
-int task_comm(int s) {
-  // serialize latest data and send over uart to esp32
-  // parse downlink commands and update thresholds
-  return s;
-}
-
-int task_heartbeat(int s) {
-  // toggle led or print diagnostics
+//  fan led task: mirror fan state to led (pc13 active-low)
+int task_fan_led(int s) {
+  digitalWrite(LED_PIN, g_fan_on ? LOW : HIGH);
   return s;
 }
