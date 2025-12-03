@@ -14,7 +14,7 @@ void setup() {
   Wire.begin(21, 22);   // SDA=21, SCL=22
 
   ina219.begin();
-  ina219.setCalibration_16V_400mA();  // good for 5V fans
+  ina219.setCalibration_16V_400mA();  
 
   pinMode(MOSFET_PIN, OUTPUT);
   pinMode(SWITCH_PIN, INPUT_PULLUP);
