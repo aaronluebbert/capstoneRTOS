@@ -2,7 +2,7 @@
 
 this repo contains two sketches that work together:
 
-1) **stm32f103c8t6 (blue pill)**  
+1) **stm32f103c8t6**  
    a very small cooperative “rtos” that:
    - reads a 10k thermistor (raw adc)
    - drives two 8-led neopixel strips:
